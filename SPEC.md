@@ -1,12 +1,11 @@
 # Student Enrollment AI Agent — Specification
 
-> Status: **Phase 1 — awaiting approval.**
-> Implementation starts only after the explicit message `APPROVED — START IMPLEMENTATION`.
+> Status: **Phase 1 complete — awaiting `APPROVED — START IMPLEMENTATION`.**
 >
 > Sections 1–18 are the agreed specification. Paragraphs marked **Clarification**
 > resolve ambiguity in the original draft without changing its intent.
-> Section 19 lists decisions that need an explicit answer before implementation,
-> each with a recommendation.
+> Section 19 records the six decisions, now settled. Section 20 fixes the test scope,
+> Section 21 keeps the review notes.
 
 ---
 
@@ -240,8 +239,7 @@ A repository layer isolates all SQL, so SQLite can later be replaced by a real S
 
 ## 6. Required Tools
 
-Exactly three primary business tools (plus, subject to Decision D1, one non-business
-escalation tool).
+Exactly three tools. There is no escalation tool — escalation is handled by the graph (§7).
 
 ### get_program_info
 
@@ -265,7 +263,10 @@ the available programs because that list comes from the tool, not from the model
 
 ### check_application_status
 
-Input: `{ "applicant_id": "APP-1042" }`
+Input: `{ "applicant_id": "APP-1042" }` — `applicant_id` is **optional** (D2). When the student does
+not state an ID ("what's my status?"), the model omits it and the service resolves the authenticated
+student's own application. Omitting it is not a way to widen access: the lookup is scoped to the
+authenticated `student_id` either way.
 
 The service verifies the application belongs to the authenticated student **before** returning any
 field.
@@ -326,20 +327,41 @@ Input Guardrail
   v
 Agent
   |
-  +---- Tool Call ----> ToolNode ----> Agent
+  +---- Tool Call --------------> ToolNode ----> Agent
   |
-  +---- No Tool ------> Response ----> END
+  +---- No applicable tool -----> Escalate ----> END
+  |
+  +---- Grounded answer --------> Response ----> END
 ```
 
 The agent may perform multiple tool calls per turn (including parallel tool calls).
 
 **Clarification — loop bound.** The agent↔tool cycle is capped (`recursion_limit`, max 5 tool
-rounds per turn). On exceeding it, the turn ends with the escalation message and an `ESCALATION`
-log event.
+rounds per turn). On exceeding it, the turn ends in the escalate node with an `ESCALATION` log event.
 
-**Clarification — escalation determinism.** Turns 4 and 5 of §11 must escalate reliably. The system
-prompt states the rule, and the escalation text is emitted as a constant by application code rather
-than generated. See Decision D1 for the exact mechanism.
+### Escalation is an application-level outcome (D1)
+
+There is **no** `escalate_to_counselor` tool. The LLM never authors the escalation text and never
+calls anything to escalate. The graph resolves it:
+
+1. The system prompt instructs: when the question cannot be answered from the three business tools,
+   reply with the single token `ESCALATE` and nothing else — no apology, no explanation, no
+   alternative suggestion.
+2. The conditional edge out of `agent` routes on the message itself:
+
+```text
+final AIMessage has tool_calls        -> tools
+final AIMessage content == ESCALATE   -> escalate      (token is a constant, matched after strip/upper)
+otherwise                             -> respond
+```
+
+3. The `escalate` node discards the model's content entirely and emits
+   `constants.ESCALATION_MESSAGE` verbatim, sets `status: "escalated"`, and logs `ESCALATION`.
+
+The token is a routing signal, never shown to the student — the node replaces it, so a leaked
+sentinel is impossible. The same node is the terminus for guardrail injection rejections, the
+recursion cap, and unrecoverable tool/LLM failures, so every escalation path produces byte-identical
+text from one constant.
 
 LangGraph maintains conversation state per session via a checkpointer (see §9).
 
@@ -404,6 +426,10 @@ turns, not raw list slicing:
 therefore attacker-controlled. The checkpointer key is **not** `session_id` alone. It is
 `thread_id = f"{student_id}:{session_id}"`, derived from the verified JWT, so supplying another
 student's `session_id` creates a new empty thread instead of reading their history.
+
+**Clarification — checkpointer (D3).** `MemorySaver`, in-process. History resets on restart and does
+not survive multiple workers; acceptable for the demo, and the app runs single-worker. Swapping in
+`SqliteSaver` is a one-line change, listed in the README as a production enhancement.
 
 ---
 
@@ -510,7 +536,6 @@ LOG_LEVEL=INFO
 APP_ENV=development
 
 DATABASE_PATH=enrollment.db
-CHECKPOINT_DB_PATH=checkpoints.db
 ```
 
 `.env.example` is committed. `.env` is git-ignored and never committed.
@@ -630,20 +655,44 @@ No functionality outside this specification without discussing it first.
 
 ---
 
-## 19. Open Decisions (need an answer before Phase 2)
+## 19. Decisions (settled)
 
-| # | Decision | Recommendation |
-| - | -------- | -------------- |
-| **D1** | Escalation mechanism. Prompt-only escalation is unreliable, especially for Turn 5. Options: (a) add a fourth, non-business tool `escalate_to_counselor(reason)` that routes to an escalation node emitting the constant text; (b) prompt-only, with the agent node substituting the constant when the model signals escalation. | **(a)**. It keeps "exactly three *business* tools" true, makes Turns 4–5 deterministic and testable, and gives a clean `ESCALATION` log event. |
-| **D2** | `applicant_id` when the student doesn't state one ("what's my status?"). | Make `applicant_id` optional. When omitted, the service resolves the authenticated student's own application. Authorization is unchanged; this only avoids a pointless "what's your ID?" round trip. |
-| **D3** | Checkpointer: in-memory `MemorySaver` vs `SqliteSaver`. | **`SqliteSaver`** on a separate `checkpoints.db`. Survives restarts, satisfies "LangGraph checkpointing" properly, no new dependency class. |
-| **D4** | Test strategy for the agent. | Deterministic unit tests (repos, auth, authorization denial, trimming, guardrail parsing, escalation constant) with **no** API key required, plus a graph test using a fake chat model, plus `tests/test_five_turn_demo.py` that runs against the real API and is skipped when `OPENAI_API_KEY` is absent. Also a runnable `scripts/demo.py` printing the five turns and the tools chosen. |
-| **D5** | `OPENAI_MODEL` default. | `gpt-4o-mini` (supports structured outputs + parallel tool calls, cheap). Change it if you want a specific model. |
-| **D6** | UI token storage. | Keep the JWT in a JavaScript variable in memory for the demo; note httpOnly cookies as the production answer. |
+| # | Decision | Resolution |
+| - | -------- | ---------- |
+| **D1** | Escalation mechanism | **No fourth tool.** Escalation is an application-level outcome: `Agent → no applicable business tool → escalate node → constant message`. Mechanism in §7. |
+| **D2** | `applicant_id` optional | **Yes.** Omitted → service resolves the authenticated student's own application. §6. |
+| **D3** | Checkpointer | **`MemorySaver`** (in-process) for the demo. §9. |
+| **D4** | Tests | **Critical tests only** — see §20. |
+| **D5** | Model | **`gpt-4o-mini`**, overridable via `OPENAI_MODEL`. §13. |
+| **D6** | UI token storage | **In-memory JS variable.** §4. |
 
 ---
 
-## 20. Notes recorded during review (no decision needed)
+## 20. Test Scope (D4 — critical only)
+
+Deterministic tests, no `OPENAI_API_KEY` required, no network:
+
+1. **Authorization denial** — STUDENT-001 requesting APP-1043 and requesting a nonexistent
+   APP-9999 return byte-identical payloads, and neither contains STUDENT-002's name, program,
+   status, or next step.
+2. **Session isolation** — two students using the same `session_id` string get separate threads;
+   neither sees the other's messages.
+3. **History trimming** — a trimmed window never starts with an orphan `ToolMessage` and never
+   retains an AI message whose `tool_calls` lost their results; the system prompt survives.
+4. **Escalation routing** — the `escalate` node emits `ESCALATION_MESSAGE` verbatim and never leaks
+   the `ESCALATE` token, driven through the graph with a fake chat model.
+5. **Auth** — login succeeds, wrong password gives the same generic error as unknown email, no
+   plaintext password is stored, and the chat endpoint rejects a missing/expired token.
+
+Plus one live demonstration, not part of the deterministic suite:
+
+6. **`scripts/demo.py`** — runs the §11 five turns against the real API in one session and prints
+   each turn, the tool selected, and the final message, then the isolation turn (STUDENT-001 asking
+   for APP-1043). This is the five-turn demonstration required by §18 step 13.
+
+---
+
+## 21. Notes recorded during review (no decision needed)
 
 * **Turn 3 / seed alignment** — the expected Turn 3 output names John Smith, so the demo login must
   be STUDENT-001 / `john@example.com`, who owns APP-1042. Fixed in §5.
