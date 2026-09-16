@@ -39,7 +39,8 @@ from app.constants.constants import (
     ChatStatus,
     Events,
 )
-from app.service.agent.prompts import AGENT_SYSTEM_PROMPT
+from app.repository import enrollment_repository
+from app.service.agent.prompts import build_agent_system_prompt
 from app.service.guardrails.input_guardrail import InputGuardrail
 from app.service.tools.enrollment_tools import BUSINESS_TOOLS
 from app.utilities.logger import get_logger
@@ -73,6 +74,9 @@ def build_graph(llm=None, guardrail: InputGuardrail | None = None, checkpointer=
     settings = get_settings()
     guard = guardrail or InputGuardrail()
     tool_node = ToolNode(BUSINESS_TOOLS)
+
+    # Program names come from the repository, so the prompt cannot drift from the data.
+    system_prompt = build_agent_system_prompt(enrollment_repository.list_program_names())
 
     _bound: dict[str, Any] = {}
 
@@ -141,7 +145,7 @@ def build_graph(llm=None, guardrail: InputGuardrail | None = None, checkpointer=
                 max_chat_history=settings.max_chat_history,
             )
 
-        payload = [SystemMessage(content=AGENT_SYSTEM_PROMPT), *trimmed]
+        payload = [SystemMessage(content=system_prompt), *trimmed]
 
         log.event(
             Events.LLM_CALL_STARTED,
