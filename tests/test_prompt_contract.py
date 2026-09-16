@@ -48,5 +48,17 @@ def test_prompt_allows_naming_programs_but_not_describing_them_unaided():
     assert "you must call a tool first" in FLAT
 
 
+def test_prompt_forbids_embellishing_tool_results_with_a_degree_level():
+    """A live run had the model infer "Bachelor's degree" from a 4-year duration.
+
+    The program tool returns name, duration, tuition and prerequisites — nothing about the
+    award — so any degree level in a reply is ungrounded.
+    """
+    assert "never state a degree level or award" in FLAT.lower()
+    for invented in ("Bachelor's", "Master's", "BSc", "MSc", "accreditation"):
+        assert invented in FLAT
+    assert "If the tool did not return it, you do not know it." in FLAT
+
+
 def test_prompt_forbids_relative_date_arithmetic():
     assert "never compute how many days remain" in FLAT
