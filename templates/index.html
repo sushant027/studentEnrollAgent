@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Enrollment Assistant</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="header">
+      <h1>Enrollment Assistant</h1>
+      <div class="who" id="who" hidden>
+        <span id="whoLabel"></span>
+        <button id="logout" type="button">Sign out</button>
+      </div>
+    </header>
+
+    <section id="loginView" class="panel">
+      <h2>Sign in</h2>
+      <form id="loginForm" autocomplete="on">
+        <label for="email">Email</label>
+        <input id="email" name="email" type="email" value="john@example.com" required />
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" value="password123" required />
+        <button type="submit" id="loginBtn">Sign in</button>
+        <p class="error" id="loginError" role="alert"></p>
+      </form>
+      <p class="hint">
+        Demo accounts: john@example.com, maria@example.com, amit@example.com &mdash;
+        password <code>password123</code>
+      </p>
+    </section>
+
+    <section id="chatView" class="panel" hidden>
+      <div id="messages" class="messages" aria-live="polite"></div>
+      <form id="chatForm">
+        <input id="message" type="text" placeholder="Ask about programs, deadlines or your application&hellip;"
+               autocomplete="off" required />
+        <button type="submit" id="sendBtn">Send</button>
+      </form>
+      <p class="hint">Session: <code id="sessionLabel"></code></p>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
