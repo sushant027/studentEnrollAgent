@@ -1,525 +1,314 @@
 # Student Enrollment AI Agent — Specification
 
-> Status: **Phase 1 complete — awaiting `APPROVED — START IMPLEMENTATION`.**
+> Scope: a 1-hour live coding assignment. Everything here is buildable in that window.
+> Anything beyond it belongs in the README under **Future Enhancements**, not in this spec.
 >
-> Sections 1–18 are the agreed specification. Paragraphs marked **Clarification**
-> resolve ambiguity in the original draft without changing its intent.
-> Section 19 records the six decisions, now settled. Section 20 fixes the test scope,
-> Section 21 keeps the review notes.
+> Status: **Phase 1 complete — awaiting `APPROVED — START IMPLEMENTATION`.**
 
 ---
 
 ## 1. Objective
 
-Build a conversational Student Enrollment Assistant for a university admissions office.
+A conversational Student Enrollment Assistant for a university admissions office. It answers
+questions about **programs**, **deadlines**, and **application status**.
 
-The assistant should answer:
-
-* Program information
-* Application deadlines
-* Application status
-
-The assistant must use tools for factual information and must not hallucinate information.
-
-If a question cannot be answered using the available tools, the assistant must respond with
-exactly this sentence (the **escalation message**):
+Facts come from tools, never from model knowledge. When the three tools cannot answer a question,
+the application returns this exact sentence (the **escalation message**):
 
 > "I'd recommend speaking with an enrollment counselor for that. Would you like me to connect you?"
 
-**Clarification.** The escalation message is a constant defined in `app/constants/`. It is emitted
-verbatim by application code, not paraphrased by the LLM (see §7 and Decision D1).
-
 ---
 
-## 2. Technology Stack
+## 2. Stack
 
-* Python 3.11+
-* FastAPI
-* SQLite
-* HTML/CSS
-* LangChain
-* LangGraph
-* OpenAI
-* Pydantic (+ `pydantic-settings`)
-* `.env` configuration
+Python 3.11+ · FastAPI · LangChain · LangGraph · OpenAI · Pydantic · SQLite (auth only) · HTML/CSS
 
-### Responsibilities
+| Component | Responsibility |
+| --------- | -------------- |
+| FastAPI   | API + authentication boundary |
+| LangChain | OpenAI client and `@tool` definitions |
+| LangGraph | Graph orchestration + per-session memory (`MemorySaver`) |
+| Tools     | Return mock business data |
+| SQLite    | Students and password hashes only |
+| HTML/CSS  | Minimal login + chat page |
 
-| Component | Responsibility                                  |
-| --------- | ----------------------------------------------- |
-| FastAPI   | API and authentication boundary                 |
-| SQLite    | Student, application, program and deadline data |
-| LangChain | OpenAI integration and tool definitions         |
-| LangGraph | Agent orchestration and session state           |
-| Tools     | Access business data                            |
-| HTML/CSS  | Simple chat UI                                  |
-
-Use native structured LLM tool calling (`bind_tools`). Do not implement a manual text-based
-ReAct parser.
+Native tool calling via `llm.bind_tools(...)`. **No manual ReAct text parser.**
 
 ---
 
 ## 3. Architecture
 
 ```text
-Browser
-   |
-   v
-FastAPI
-   |
-   +---- Login ----> SQLite
-   |
-   v
-Authenticated Student
-   |
-   v
-Input Guardrail
-   |
-   v
-LangGraph Agent
-   |
-   +---- Tool required ----> Tool ----> SQLite
-   |                            |
-   |                            v
-   |                          Agent
-   |
-   +---- No applicable tool --> Escalation
-   |
-   v
-Response
+Browser → FastAPI → [auth: verify JWT → student_id]
+                          ↓
+                    Input Guardrail
+                          ↓
+                        Agent  ⇄  ToolNode → mock data
+                          ↓
+              respond  |  escalate (constant message)
+                          ↓
+                       Response
 ```
 
-The LLM decides **what action/tool is required**.
-
-The application code decides **whether the student is authorized**.
-
-The LLM must never make authorization decisions.
+The **LLM** decides which tool to call and resolves conversational context ("that").
+The **application** decides who the student is and what they may see.
+The LLM is never trusted for access control.
 
 ---
 
-## 4. Authentication & Student Isolation
+## 4. Authentication
 
 ```text
-POST /api/v1/auth/login
+POST /api/v1/auth/login     { "email": "...", "password": "..." }
+                         →  { "access_token": "...", "student_id": "STUDENT-001" }
 ```
 
-Request:
+* JWT, HS256, claims: `sub` = `student_id`, `exp`. Nothing else.
+* Passwords stored as bcrypt hashes (`passlib`), never plaintext.
+* `POST /api/v1/enrollment/chat` requires `Authorization: Bearer <token>`.
+* Invalid credentials → `401` with one generic message (no account enumeration).
+  Missing/expired token → `401`.
 
-```json
-{ "email": "john@example.com", "password": "password123" }
-```
+---
 
-Response:
+## 5. Student Data Isolation (the security requirement)
 
-```json
-{ "access_token": "...", "token_type": "bearer", "student_id": "STUDENT-001" }
-```
-
-Authentication uses a simple JWT (HS256). Passwords are stored as hashes (bcrypt via `passlib`),
-never plaintext.
-
-**Clarification — token handling.**
-
-* JWT claims: `sub` = `student_id`, `exp`, `iat`, `jti`. No PII (no name, no email) in the token.
-* The chat endpoint requires `Authorization: Bearer <token>`.
-* `student_id` is read from the verified token on every request. A `student_id` present in a
-  request body, chat message, or tool argument is never trusted.
-* Expired/invalid token → `401`. No refresh token; the demo UI asks the student to log in again.
-
-### Student Data Isolation
-
-A student must only be able to access their own application information.
+`student_id` comes **only** from the verified JWT. It is never read from the user's message, the
+request body, the LLM, or a tool argument.
 
 ```text
 STUDENT-001 → APP-1042
 STUDENT-002 → APP-1043
+STUDENT-003 → APP-1044
 ```
 
-If STUDENT-001 asks for APP-1043:
+STUDENT-001 asking for APP-1043 is denied by service code **before** any field is read.
 
-```text
-Authenticated student STUDENT-001
-Requested application APP-1043 → belongs to STUDENT-002
-        |
-        v
-DENY
-```
+Two rules:
 
-Do not reveal the other student's name, program, status, next step, or the **existence** of the
-application.
+1. **`student_id` is not in the tool schema.** The LLM cannot see it, set it, or reason about it.
+   It is injected at runtime from the JWT via LangGraph's `config["configurable"]`.
+2. **A denial reveals nothing.** "Belongs to another student" and "does not exist" return the
+   *identical* result:
 
-**Clarification — non-revealing denial (important).** "Application belongs to someone else" and
-"application does not exist" must be **indistinguishable** to the caller. Both return the identical
-tool result:
+   ```json
+   { "error": "not_found" }
+   ```
 
-```json
-{ "error": "not_found", "message": "No application matching that ID is available on your account." }
-```
+   Different wording for the two cases would confirm that APP-1043 exists. The agent renders this
+   as one fixed sentence and does not speculate.
 
-Any difference in wording, latency-visible behaviour, or logging surfaced to the user would leak
-the existence of another student's application. The agent renders this result as a fixed sentence
-and must not speculate about why.
-
-Authorization happens in the service layer, before any protected row is returned to the tool.
+Session memory is isolated the same way — see §9.
 
 ---
 
-## 5. Database
+## 6. Data
 
-SQLite, created and seeded at startup if absent.
+Business data is **mock data in Python** (`app/repository/mock_data.py`) — dicts for 3 programs,
+3 applications, 3 deadline sets. No tables, no SQL, no migrations.
 
-### students
+SQLite holds **one** table, because passwords need a real store and hashing is part of the point:
 
-```text
-id                INTEGER PK
-student_id        TEXT UNIQUE NOT NULL     -- STUDENT-001
-name              TEXT NOT NULL
-email             TEXT UNIQUE NOT NULL     -- COLLATE NOCASE
-password_hash     TEXT NOT NULL
+```sql
+students(student_id TEXT PRIMARY KEY, name TEXT, email TEXT UNIQUE, password_hash TEXT)
 ```
 
-### applications
+Created and seeded at startup if absent.
 
-```text
-id                INTEGER PK
-applicant_id      TEXT UNIQUE NOT NULL     -- APP-1042
-student_id        TEXT NOT NULL REFERENCES students(student_id)
-program_name      TEXT NOT NULL
-status            TEXT NOT NULL            -- CHECK in ('Under Review','Accepted','Documents Pending')
-next_step         TEXT NOT NULL
-```
+Both sit behind a thin repository module, so the mock dicts can be swapped for a real SIS later
+without touching tools or the agent.
 
-### programs
+### Seed / mock data
 
-```text
-id                INTEGER PK
-program_name      TEXT UNIQUE NOT NULL     -- COLLATE NOCASE
-duration          TEXT NOT NULL
-tuition           TEXT NOT NULL
-prerequisites     TEXT NOT NULL
-```
+| student_id | name | email | password | applicant_id |
+| ---------- | ---- | ----- | -------- | ------------ |
+| STUDENT-001 | John Smith | john@example.com | password123 | APP-1042 |
+| STUDENT-002 | Maria Lopez | maria@example.com | password123 | APP-1043 |
+| STUDENT-003 | Amit Rao | amit@example.com | password123 | APP-1044 |
 
-### deadlines
+Demo passwords only, documented in the README, never in `.env`.
 
-```text
-id                INTEGER PK
-program_name      TEXT UNIQUE NOT NULL REFERENCES programs(program_name)   -- COLLATE NOCASE
-application_deadline           TEXT NOT NULL   -- ISO 8601 (YYYY-MM-DD)
-document_submission_deadline   TEXT NOT NULL   -- ISO 8601
-decision_notification_date     TEXT NOT NULL   -- ISO 8601
-```
-
-**Clarification — dates.** Dates are stored ISO 8601 and formatted for display
-(`"March 15, 2027"`) in the service layer, so they remain sortable and comparable.
-
-### Seed data (fixed, so the five-turn test is reproducible)
-
-Students (demo passwords only; documented in the README, never in `.env`):
-
-| student_id  | name        | email               | password    |
-| ----------- | ----------- | ------------------- | ----------- |
-| STUDENT-001 | John Smith  | john@example.com    | password123 |
-| STUDENT-002 | Maria Lopez | maria@example.com   | password123 |
-| STUDENT-003 | Amit Rao    | amit@example.com    | password123 |
-
-Applications:
-
-| applicant_id | student_id  | program_name            | status            | next_step                                |
-| ------------ | ----------- | ----------------------- | ----------------- | ---------------------------------------- |
-| APP-1042     | STUDENT-001 | Computer Science        | Under Review      | Submit remaining required documents      |
-| APP-1043     | STUDENT-002 | Business Administration | Documents Pending | Upload official transcripts              |
-| APP-1044     | STUDENT-003 | Nursing                 | Accepted          | Confirm enrollment and pay the deposit   |
+| applicant_id | program | status | next_step |
+| ------------ | ------- | ------ | --------- |
+| APP-1042 | Computer Science | Under Review | Submit remaining required documents |
+| APP-1043 | Business Administration | Documents Pending | Upload official transcripts |
+| APP-1044 | Nursing | Accepted | Confirm enrollment and pay the deposit |
 
 Programs: Computer Science, Business Administration, Nursing — each with duration, tuition,
-prerequisites, and a full row in `deadlines`.
-
-A repository layer isolates all SQL, so SQLite can later be replaced by a real SIS/CRM.
-
----
-
-## 6. Required Tools
-
-Exactly three tools. There is no escalation tool — escalation is handled by the graph (§7).
-
-### get_program_info
-
-Input: `{ "program_name": "Computer Science" }`
-
-Output:
-
-```json
-{
-  "program_name": "Computer Science",
-  "duration": "4 years",
-  "tuition": "$40,000/year",
-  "prerequisites": "High school diploma with mathematics"
-}
-```
-
-**Clarification — matching.** Lookup is case-insensitive and whitespace-normalized, with a small
-explicit alias map (`"CS"`, `"comp sci"` → `Computer Science`). No fuzzy guessing beyond the map.
-Unknown program → `{"error": "unknown_program", "available_programs": [...]}`; the agent may list
-the available programs because that list comes from the tool, not from the model.
-
-### check_application_status
-
-Input: `{ "applicant_id": "APP-1042" }` — `applicant_id` is **optional** (D2). When the student does
-not state an ID ("what's my status?"), the model omits it and the service resolves the authenticated
-student's own application. Omitting it is not a way to widen access: the lookup is scoped to the
-authenticated `student_id` either way.
-
-The service verifies the application belongs to the authenticated student **before** returning any
-field.
-
-Output:
-
-```json
-{
-  "applicant_name": "John Smith",
-  "program": "Computer Science",
-  "status": "Under Review",
-  "next_step": "Submit remaining required documents"
-}
-```
-
-Allowed statuses: `Under Review`, `Accepted`, `Documents Pending`.
-
-**Clarification — identity injection.** `student_id` is **not** a parameter in the tool schema the
-LLM sees. It is injected at runtime from the verified JWT via the LangGraph
-`config["configurable"]` / `InjectedToolArg` mechanism. The model therefore cannot supply, alter,
-or reason about whose data is fetched.
-
-Failure modes, all returning the identical non-revealing payload from §4: unknown `applicant_id`,
-`applicant_id` owned by another student.
-
-### get_deadlines
-
-Input: `{ "program_name": "Computer Science" }`
-
-Output:
-
-```json
-{
-  "program_name": "Computer Science",
-  "application_deadline": "March 15, 2027",
-  "document_submission_deadline": "March 20, 2027",
-  "decision_notification_date": "April 15, 2027"
-}
-```
-
-Same matching and unknown-program rules as `get_program_info`.
-
-**Clarification.** The agent states dates as returned. It must not compute "days remaining" or any
-other relative time claim — there is no clock tool.
+prerequisites, and a full set of deadlines. Statuses are limited to `Under Review`, `Accepted`,
+`Documents Pending`.
 
 ---
 
-## 7. LangGraph Workflow
+## 7. The Three Tools
+
+Exactly three. There is no escalation tool — escalation is a graph outcome (§8).
+
+**`get_program_info(program_name)`**
+
+```json
+{ "program_name": "Computer Science", "duration": "4 years",
+  "tuition": "$40,000/year", "prerequisites": "High school diploma with mathematics" }
+```
+
+**`get_deadlines(program_name)`**
+
+```json
+{ "program_name": "Computer Science", "application_deadline": "March 15, 2027",
+  "document_submission_deadline": "March 20, 2027", "decision_notification_date": "April 15, 2027" }
+```
+
+**`check_application_status(applicant_id=None)`**
+
+```json
+{ "applicant_name": "John Smith", "program": "Computer Science",
+  "status": "Under Review", "next_step": "Submit remaining required documents" }
+```
+
+* Ownership is verified against the JWT's `student_id` before any field is returned.
+* `applicant_id` is optional: omitted → the authenticated student's own application. Either path is
+  scoped to the authenticated student, so omitting it cannot widen access.
+* Unknown ID and someone else's ID both return `{"error": "not_found"}`.
+
+Program lookups are case-insensitive (`"computer science"` matches). Unknown program →
+`{"error": "unknown_program"}`; the agent escalates rather than inventing a program.
+
+---
+
+## 8. LangGraph Workflow
 
 ```text
-START
-  |
-  v
-Input Guardrail
-  |
-  +---- blocked ----> Rejection/Escalation ----> END
-  |
-  v
-Agent
-  |
-  +---- Tool Call --------------> ToolNode ----> Agent
-  |
-  +---- No applicable tool -----> Escalate ----> END
-  |
-  +---- Grounded answer --------> Response ----> END
+START → guardrail → agent → tools → agent → respond  → END
+                      └──────────────────→ escalate → END
 ```
 
-The agent may perform multiple tool calls per turn (including parallel tool calls).
+Three nodes plus a tool node. `MemorySaver` checkpointer, in-process.
 
-**Clarification — loop bound.** The agent↔tool cycle is capped (`recursion_limit`, max 5 tool
-rounds per turn). On exceeding it, the turn ends in the escalate node with an `ESCALATION` log event.
+### Escalation without a fourth tool
 
-### Escalation is an application-level outcome (D1)
+The model chooses *whether* it can answer; the application writes the words.
 
-There is **no** `escalate_to_counselor` tool. The LLM never authors the escalation text and never
-calls anything to escalate. The graph resolves it:
+1. System prompt: if the question cannot be answered by the three tools, reply with exactly
+   `ESCALATE` — nothing else.
+2. The conditional edge out of `agent` routes on the message:
 
-1. The system prompt instructs: when the question cannot be answered from the three business tools,
-   reply with the single token `ESCALATE` and nothing else — no apology, no explanation, no
-   alternative suggestion.
-2. The conditional edge out of `agent` routes on the message itself:
+   ```text
+   has tool_calls        → tools
+   content is ESCALATE   → escalate
+   otherwise             → respond
+   ```
 
-```text
-final AIMessage has tool_calls        -> tools
-final AIMessage content == ESCALATE   -> escalate      (token is a constant, matched after strip/upper)
-otherwise                             -> respond
-```
+3. The `escalate` node **discards the model's content** and emits the constant escalation message,
+   sets `status: "escalated"`, and logs `ESCALATION`.
 
-3. The `escalate` node discards the model's content entirely and emits
-   `constants.ESCALATION_MESSAGE` verbatim, sets `status: "escalated"`, and logs `ESCALATION`.
-
-The token is a routing signal, never shown to the student — the node replaces it, so a leaked
-sentinel is impossible. The same node is the terminus for guardrail injection rejections, the
-recursion cap, and unrecoverable tool/LLM failures, so every escalation path produces byte-identical
-text from one constant.
-
-LangGraph maintains conversation state per session via a checkpointer (see §9).
+Because the node substitutes the constant, the token can never reach the student. The same node
+also terminates guardrail injection rejections and tool/LLM failures, so every escalation path
+produces byte-identical text from one constant.
 
 ---
 
-## 8. Input Guardrail
+## 9. Session Memory
 
-Runs before the agent. Two checks:
+* `MemorySaver`, keyed by `thread_id`.
+* **`thread_id = f"{student_id}:{session_id}"`.** `session_id` arrives in the request body and is
+  therefore client-controlled; namespacing it with the JWT's `student_id` means sending another
+  student's `session_id` opens an empty thread instead of reading their history.
+* Last `MAX_CHAT_HISTORY=10` messages, via LangChain `trim_messages(start_on="human",
+  include_system=True)`. Using `start_on="human"` matters: a raw slice can leave an orphan
+  `ToolMessage` at the window edge, which OpenAI rejects outright.
 
-1. Prompt injection
-2. Relevance to the enrollment assistant
+Run single-worker — `MemorySaver` is per-process.
 
-Output:
+---
+
+## 10. Input Guardrail
+
+One LLM call with structured output before the agent:
 
 ```json
 { "allowed": true, "is_injection": false, "is_in_scope": true }
 ```
 
-Implementation: a cheap deterministic pre-filter (empty/oversized input, obvious
-instruction-override patterns) followed by a single structured-output LLM classification into the
-Pydantic model above.
+It asks only *"is this about university enrollment, and is it an injection attempt?"* — **not**
+"can a tool answer it?" That distinction carries Turn 4: "Can I get a fee waiver?" is in scope, so
+it passes the guardrail and the *agent* escalates. A guardrail that reasoned about tool coverage
+would block it and produce the wrong outcome.
 
-**Clarification — scope is broad, not tool-shaped.** The guardrail only asks "is this about
-university enrollment?" It must **not** check whether a tool exists. "Can I get a fee waiver?" and
-"What documents do I still need?" are in scope and must pass the guardrail; the *agent* then
-escalates because no tool applies:
+Injection → escalation message. Off-topic → a short in-scope reminder. Guardrail failure → fail
+closed to the escalation message.
+
+---
+
+## 11. API
 
 ```text
-ALLOW → Agent → No applicable tool → Escalate
+POST /api/v1/auth/login            → access_token, student_id
+POST /api/v1/enrollment/chat       → { session_id, message, status }   (Bearer token required)
+GET  /health                       → { "status": "ok" }
+GET  /                             → login + chat UI
 ```
 
-Follow-ups that depend on context ("What's the application deadline for that?") are in scope. The
-guardrail sees the recent conversation so pronouns do not cause false rejections.
+Chat request: `{ "session_id": "SESSION-001", "message": "..." }`
+`status` ∈ `success` · `escalated` · `blocked` · `error`.
 
-**Clarification — failure behaviour.** If the guardrail LLM call fails or returns unparseable
-output, the turn fails closed: the student receives the escalation message, and `ERROR` +
-`INPUT_GUARD_RESULT` are logged. A guardrail rejection returns a polite in-scope reminder for
-off-topic input, and the escalation message for detected injection — never an echo of the
-offending text.
+Student identity comes from the token, never the body.
 
 ---
 
-## 9. Conversation Memory
+## 12. Required Five-Turn Conversation
 
-The latest **10 messages per session** are retained, configurable:
+One session, logged in as STUDENT-001 (John Smith).
 
-```env
-MAX_CHAT_HISTORY=10
-```
+| # | Message | Expected |
+| - | ------- | -------- |
+| 1 | "Hi, what programs do you offer in computer science?" | `get_program_info("Computer Science")` |
+| 2 | "What's the application deadline for that?" | `"that"` → Computer Science → `get_deadlines("Computer Science")` |
+| 3 | "I already applied. My ID is APP-1042. What's my status?" | `check_application_status("APP-1042")` |
+| 4 | "Can I get a fee waiver?" | no tool covers it → escalation message |
+| 5 | "What documents do I still need to submit?" | no tool lists documents → escalation message |
 
-**Clarification — what counts and how trimming works (important).** Trimming operates on complete
-turns, not raw list slicing:
+**Turn 5 is the one that proves the point.** Turn 3 already put
+`next_step: "Submit remaining required documents"` into the conversation, so the model has
+something plausible to answer with. The system prompt states it explicitly: `next_step` is a status
+label, not a document checklist; no tool returns required documents; any question about *which*
+documents are outstanding escalates. Inferring a document list from `next_step` is exactly the
+hallucination this demo exists to rule out.
 
-* The system prompt is always retained and is not counted.
-* The window counts human + final AI messages. Tool-call/tool-result pairs are kept intact with
-  their parent AI message.
-* A trimmed history never begins with an orphan `ToolMessage` and never contains an AI message
-  whose `tool_calls` lack matching results — OpenAI rejects both.
-* Implemented with LangChain `trim_messages` (`start_on="human"`, `include_system=True`).
-
-**Clarification — session isolation (important).** `session_id` arrives in the request body and is
-therefore attacker-controlled. The checkpointer key is **not** `session_id` alone. It is
-`thread_id = f"{student_id}:{session_id}"`, derived from the verified JWT, so supplying another
-student's `session_id` creates a new empty thread instead of reading their history.
-
-**Clarification — checkpointer (D3).** `MemorySaver`, in-process. History resets on restart and does
-not survive multiple workers; acceptable for the demo, and the app runs single-worker. Swapping in
-`SqliteSaver` is a one-line change, listed in the README as a production enhancement.
+A sixth turn is demonstrated separately: STUDENT-001 asking for **APP-1043** gets the
+non-revealing denial from §5.
 
 ---
 
-## 10. Chat API
+## 13. Logging
 
-```text
-POST /api/v1/enrollment/chat        (requires Bearer token)
-```
+Structured JSON, one line per event, with `request_id`, `session_id`, `event`:
 
-Request:
+`REQUEST_RECEIVED` · `INPUT_GUARD_RESULT` · `AGENT_STARTED` · `TOOL_SELECTED` · `TOOL_EXECUTED` ·
+`ESCALATION` · `AGENT_COMPLETED` · `ERROR`
 
-```json
-{ "session_id": "SESSION-001", "message": "What's the application deadline for that?" }
-```
-
-Student identity comes from the authenticated request, never from the LLM or the request body.
-
-Response:
-
-```json
-{
-  "session_id": "SESSION-001",
-  "message": "The application deadline for Computer Science is March 15, 2027.",
-  "status": "success"
-}
-```
-
-`status` ∈ `success`, `escalated`, `blocked`, `error`.
-
-Also provided:
-
-```text
-GET  /health                        -> { "status": "ok" }
-GET  /                              -> login + chat UI
-```
+Never logged: passwords, hashes, API keys, JWTs, student names, email addresses. Message bodies are
+not logged at `INFO` — tool name, outcome, and IDs (`student_id`, `applicant_id`) are, because
+access decisions need to be auditable.
 
 ---
 
-## 11. Required Five-Turn Test
+## 14. Error Handling
 
-All five turns run in one session as STUDENT-001 (John Smith).
+| Case | Behaviour |
+| ---- | --------- |
+| Invalid request body | `422` |
+| Bad credentials / bad token | `401`, generic message |
+| Another student's or unknown application | `{"error": "not_found"}` from the tool; HTTP stays `200` |
+| Unknown program | `{"error": "unknown_program"}` → agent escalates |
+| Tool or LLM failure | `200`, escalation message, `ERROR` logged |
+| Guardrail rejection | `200`, `status: "blocked"` |
+| Unexpected | `500` with `request_id`, no stack trace to the client |
 
-**Turn 1** — `Hi, what programs do you offer in computer science?`
-→ `get_program_info("Computer Science")`
-
-**Turn 2** — `What's the application deadline for that?`
-→ `"that"` resolves to Computer Science → `get_deadlines("Computer Science")`
-
-**Turn 3** — `I already applied. My ID is APP-1042. What's my status?`
-→ `check_application_status("APP-1042")`
-
-**Turn 4** — `Can I get a fee waiver?`
-→ no available tool → escalation. No invented answer.
-
-**Turn 5** — `What documents do I still need to submit?`
-→ no available tool → escalation.
-
-**Clarification — Turn 5 is the hard one.** Turn 3 already put
-`next_step: "Submit remaining required documents"` into the conversation state. The model will be
-tempted to answer from it. The system prompt states explicitly: `next_step` is a status label, not
-a document checklist; there is no tool that lists required documents; any question about *which*
-documents are outstanding escalates. This is covered by a dedicated regression test.
-
-An additional isolation turn is demonstrated: STUDENT-001 asking for `APP-1043` receives the
-non-revealing denial of §4.
+A tool failure never becomes an invented answer.
 
 ---
 
-## 12. Logging
-
-Structured JSON logging with `request_id`, `session_id`, `event`.
-
-Events: `REQUEST_RECEIVED`, `INPUT_GUARD_RESULT`, `AGENT_STARTED`, `TOOL_SELECTED`,
-`TOOL_EXECUTED`, `ESCALATION`, `AGENT_COMPLETED`, `ERROR`.
-
-`request_id` is created by middleware and propagated through the agent and tools via a
-`contextvar`.
-
-**Clarification — what is never logged.** Passwords, password hashes, API keys, JWTs, email
-addresses, student names. Message bodies and tool result payloads are not logged at `INFO`; only
-metadata (message length, tool name, argument *keys*, success/failure, duration). Full payload
-logging is available at `DEBUG` and only when `APP_ENV=development`. `student_id` and
-`applicant_id` are logged as identifiers — they are needed to audit access decisions.
-
----
-
-## 13. Configuration
-
-All configuration comes from `.env`, loaded through a Pydantic `Settings` object that fails fast on
-missing required values.
+## 15. Configuration
 
 ```env
 OPENAI_API_KEY=
@@ -534,175 +323,80 @@ JWT_EXPIRY_MINUTES=30
 
 LOG_LEVEL=INFO
 APP_ENV=development
-
-DATABASE_PATH=enrollment.db
 ```
 
-`.env.example` is committed. `.env` is git-ignored and never committed.
+Loaded through a Pydantic `Settings` object. `.env.example` is committed; `.env` is git-ignored.
 
 ---
 
-## 14. Project Structure
+## 16. Project Structure
 
 ```text
-student-enrollment-agent/
-│
-├── app/
-│   ├── controller/          # FastAPI routers: auth, chat, health
-│   ├── dto/                 # Pydantic request/response models
-│   ├── service/
-│   │   ├── agent/           # LangGraph graph, nodes, system prompt
-│   │   ├── tools/           # the three business tools
-│   │   └── guardrails/      # input guardrail
-│   ├── repository/          # all SQL; schema + seed
-│   ├── model/               # domain models
-│   ├── constants/           # escalation message, statuses, events
-│   └── utilities/           # logging, jwt, security, formatting
-│
-├── templates/               # login + chat page
-├── static/                  # css, js
-├── tests/
-│
-├── .env.example
-├── .gitignore
-├── requirements.txt
-├── README.md
-└── SPEC.md
+app/
+├── controller/      auth, chat, health routes
+├── dto/             request/response models
+├── service/
+│   ├── agent/       graph, nodes, system prompt
+│   ├── tools/       the three tools
+│   └── guardrails/  input guardrail
+├── repository/      mock_data.py + students (SQLite)
+├── constants/       escalation message, events
+└── utilities/       logging, jwt, security
+templates/  static/  tests/
+.env.example  .gitignore  requirements.txt  README.md  SPEC.md
 ```
 
-Keep the implementation simple. No unnecessary infrastructure.
+---
+
+## 17. Tests
+
+Seven, all deterministic, no API key required (the agent tests drive the graph with a fake chat
+model):
+
+1. The three tools return correct mock data.
+2. Login works; wrong password fails; no plaintext password is stored.
+3. **STUDENT-001 cannot read APP-1043** — identical payload to a nonexistent ID, and no trace of
+   STUDENT-002's name, program, status, or next step.
+4. **Session isolation** — two students using the same `session_id` string get separate threads.
+5. **Prompt injection** is caught by the guardrail.
+6. **Escalation** — when no tool applies, the exact constant message is returned and the `ESCALATE`
+   token never leaks.
+7. **Five-turn conversation** — the §12 script.
+
+Test 7 also ships as `scripts/demo.py`, which runs the five turns against the real API and prints
+each turn, the tool selected, and the response — the input/output log the assignment asks for.
 
 ---
 
-## 15. Error Handling
+## 18. Build Order
 
-| Case                          | Behaviour                                                              |
-| ----------------------------- | ---------------------------------------------------------------------- |
-| Invalid request body          | `422` / `400`, structured error DTO                                    |
-| Invalid credentials           | `401`, generic "Invalid email or password" (no account enumeration)     |
-| Missing/expired token         | `401`                                                                  |
-| Unauthorized application access | Tool returns the non-revealing `not_found` payload; HTTP stays `200`  |
-| Unknown program               | Tool returns `unknown_program` + available program list                |
-| Unknown applicant             | Identical to unauthorized access                                       |
-| Tool failure                  | Structured error to the agent; agent escalates, never fabricates       |
-| LLM failure / timeout         | `200` with `status: "error"` and a safe message; `ERROR` logged        |
-| Guardrail rejection           | `200` with `status: "blocked"`                                         |
-| Unexpected error              | `500` with `request_id`, no stack trace to the client                  |
-
-Every error response carries the `request_id` so logs can be correlated.
-
-Tool failures must never result in fabricated answers.
+1. Mock data + SQLite students + auth (JWT, bcrypt)
+2. The three tools, with the ownership check
+3. LangGraph: guardrail → agent ⇄ tools → respond/escalate, `MemorySaver`
+4. FastAPI routes + minimal chat UI
+5. Logging
+6. Tests + five-turn demo
+7. README
 
 ---
 
-## 16. Security Principle
+## 19. Out of Scope
 
-```text
-LLM
- ├── Understand user request
- ├── Resolve conversation context
- └── Select appropriate tool
-
-Application
- ├── Authentication
- ├── Authorization
- ├── Student identity
- ├── Session isolation
- └── PII protection
-
-Tools
- └── Retrieve factual business information
-
-LangGraph
- └── Orchestrate workflow and state
-```
-
-The LLM must never be trusted for access control.
+RAG, vector DBs, OCR, fine-tuning, multi-agent systems, real SIS/CRM integration, Kubernetes, cloud
+deployment. Also deferred, and listed in the README under **Future Enhancements**: persistent
+checkpointing (`SqliteSaver`) for multi-worker deploys, refresh tokens and httpOnly cookies, login
+rate limiting, output-side guardrails, and a full audit trail.
 
 ---
 
-## 17. Out of Scope
+## 20. Decisions (settled)
 
-Not implemented: RAG, vector database, OCR, fine-tuning, multi-agent systems, real SIS/CRM
-integration, Kubernetes, complex cloud deployment. These are listed in the README as future
-production enhancements, alongside: persistent multi-worker session store, refresh tokens and
-httpOnly cookie storage, login rate limiting, per-tenant audit trail, and output-side guardrails.
-
----
-
-## 18. Development Process
-
-**Phase 1** — finalize this `SPEC.md`, raise issues. **STOP and wait for approval.**
-
-**Phase 2** — after `APPROVED — START IMPLEMENTATION`, build in this order:
-
-1. SQLite schema and seed data
-2. Authentication
-3. Repository layer
-4. Tools
-5. OpenAI/LangChain integration
-6. LangGraph agent
-7. Session memory
-8. Input guardrail
-9. FastAPI APIs
-10. HTML/CSS UI
-11. Logging
-12. Tests
-13. Five-turn demonstration
-14. README
-
-No functionality outside this specification without discussing it first.
-
----
-
-## 19. Decisions (settled)
-
-| # | Decision | Resolution |
-| - | -------- | ---------- |
-| **D1** | Escalation mechanism | **No fourth tool.** Escalation is an application-level outcome: `Agent → no applicable business tool → escalate node → constant message`. Mechanism in §7. |
-| **D2** | `applicant_id` optional | **Yes.** Omitted → service resolves the authenticated student's own application. §6. |
-| **D3** | Checkpointer | **`MemorySaver`** (in-process) for the demo. §9. |
-| **D4** | Tests | **Critical tests only** — see §20. |
-| **D5** | Model | **`gpt-4o-mini`**, overridable via `OPENAI_MODEL`. §13. |
-| **D6** | UI token storage | **In-memory JS variable.** §4. |
-
----
-
-## 20. Test Scope (D4 — critical only)
-
-Deterministic tests, no `OPENAI_API_KEY` required, no network:
-
-1. **Authorization denial** — STUDENT-001 requesting APP-1043 and requesting a nonexistent
-   APP-9999 return byte-identical payloads, and neither contains STUDENT-002's name, program,
-   status, or next step.
-2. **Session isolation** — two students using the same `session_id` string get separate threads;
-   neither sees the other's messages.
-3. **History trimming** — a trimmed window never starts with an orphan `ToolMessage` and never
-   retains an AI message whose `tool_calls` lost their results; the system prompt survives.
-4. **Escalation routing** — the `escalate` node emits `ESCALATION_MESSAGE` verbatim and never leaks
-   the `ESCALATE` token, driven through the graph with a fake chat model.
-5. **Auth** — login succeeds, wrong password gives the same generic error as unknown email, no
-   plaintext password is stored, and the chat endpoint rejects a missing/expired token.
-
-Plus one live demonstration, not part of the deterministic suite:
-
-6. **`scripts/demo.py`** — runs the §11 five turns against the real API in one session and prints
-   each turn, the tool selected, and the final message, then the isolation turn (STUDENT-001 asking
-   for APP-1043). This is the five-turn demonstration required by §18 step 13.
-
----
-
-## 21. Notes recorded during review (no decision needed)
-
-* **Turn 3 / seed alignment** — the expected Turn 3 output names John Smith, so the demo login must
-  be STUDENT-001 / `john@example.com`, who owns APP-1042. Fixed in §5.
-* **Existence leakage** — the single most likely way to fail §4 is returning a different message for
-  "not found" vs "not yours". Specified as one shared payload and covered by a test.
-* **`session_id` trust** — client-supplied session identifiers are a cross-student history leak
-  unless namespaced by the authenticated student. Specified in §9.
-* **History trimming** — naive `messages[-10:]` breaks the OpenAI API by orphaning tool results.
-  Specified in §9.
-* **Guardrail over-blocking** — a guardrail that reasons about tool availability would block Turn 4
-  instead of escalating it, producing the wrong `status`. Specified in §8.
-* **PII to OpenAI** — `check_application_status` results include the applicant's name, which is sent
-  to OpenAI as tool output. Inherent to the design; called out in the README.
+| Decision | Resolution |
+| -------- | ---------- |
+| Escalation | No fourth tool — graph outcome emitting a constant (§8) |
+| `applicant_id` | Optional; resolved from the authenticated student |
+| Checkpointer | `MemorySaver`, in-process |
+| Business data | Mock Python dicts; SQLite for auth only |
+| Tests | The seven in §17 |
+| Model | `gpt-4o-mini` |
+| UI token storage | In-memory JS variable |
